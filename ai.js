@@ -199,11 +199,35 @@ async function buildContext(memo) {
   };
 }
 
+// 整文に使う言葉のヒント（箱の名前など、聞き間違えやすい固有名詞）
+async function vocabulary() {
+  const boxes = await getAll('boxes');
+  return ['Yozora', ...boxes.map((b) => b.name)];
+}
+
+export async function polishText(text) {
+  const data = await callWorker('/polish', { text, vocabulary: await vocabulary() });
+  return data.text;
+}
+
 async function classifyMemo(memo) {
+  // 音声入力はまず整文して、整った文をすぐ画面に出す（Typeless のように）
+  if (memo.inputMethod === 'voice' && !memo.polished) {
+    const text = await polishText(memo.rawTranscript || memo.text);
+    const fresh = await get('memos', memo.id);
+    if (!fresh) return;
+    // 整文を待つ間に本人が書き直していたら、そちらを優先する
+    if (fresh.text === (memo.rawTranscript || memo.text)) fresh.text = text;
+    fresh.polished = true;
+    await put('memos', fresh);
+    notify({ type: 'polished', memoId: memo.id });
+    memo = fresh;
+  }
   const ctx = await buildContext(memo);
   const data = await callWorker('/classify', {
     today: localDay(),
-    memo: { text: memo.text, inputMethod: memo.inputMethod },
+    // 整文済みの音声メモは、振り分けで本文を書き換えないよう text として渡す
+    memo: { text: memo.text, inputMethod: memo.inputMethod === 'voice' && !memo.polished ? 'voice' : 'text' },
     ...ctx,
   });
   const fresh = await get('memos', memo.id);
@@ -273,8 +297,8 @@ async function applyResult(memo, result) {
       createdAt: memo.createdAt + i, // 並び順を保つ
       splitFrom: memo.id,
     };
-    // テキスト入力で分割なしなら、本文は書いたまま残す
-    if (memo.inputMethod === 'voice' || splitting) target.text = item.text;
+    // 分割なしなら本文はそのまま（音声は整文済み）。分割した時だけAIが切り出した文を使う
+    if (splitting || (memo.inputMethod === 'voice' && !memo.polished)) target.text = item.text;
     target.boxId = await resolveBox(item);
     target.labels = item.labels.length ? item.labels : ['idea'];
     target.due = item.due || null;

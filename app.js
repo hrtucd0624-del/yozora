@@ -1,7 +1,7 @@
 import { getAll, get, put, del, getMeta, setMeta, newId, exportAll, replaceAll, DATA_STORES, clearStore } from './db.js';
 import {
   processQueue, onAiChange, takeNotice, getSettings, isConfigured, getUsage, quotaReached, nextResetTime,
-  callWorker, deepdivePrompt, pairKey, MODELS, DEFAULT_MODEL, DAILY_LIMIT, AiError,
+  callWorker, deepdivePrompt, polishText, pairKey, MODELS, DEFAULT_MODEL, DAILY_LIMIT, AiError,
 } from './ai.js';
 import { setupVoice } from './voice.js';
 import { renderMap } from './map.js';
@@ -418,7 +418,8 @@ async function renderBox(boxId, filter) {
 function memoRowHtml(m) {
   const labels = m.labels.map((l) => `<span class="badge label ${l}">${LABELS[l]}</span>`).join('');
   const due = m.due ? `<span class="badge due">${formatDue(m.due)}</span>` : '';
-  const status = m.aiStatus === 'pending' || m.aiStatus === 'processing' ? `<span class="badge pending">処理中…</span>` : '';
+  const status = m.aiStatus === 'pending' || m.aiStatus === 'processing'
+    ? `<span class="badge pending">${m.inputMethod === 'voice' && !m.polished ? '整えています…' : '処理中…'}</span>` : '';
   return `<li><a class="card memo-row" href="#/memo/${m.id}">
     <div class="memo-text">${esc(m.text)}</div>
     <div class="memo-date">${formatDate(m.createdAt)}${m.inputMethod === 'voice' ? ' · 音声' : ''}</div>
@@ -524,9 +525,11 @@ async function renderMemo(id) {
     </div>` : ''}
 
     ${memo.rawTranscript && memo.rawTranscript !== memo.text ? `<details class="field raw">
-      <summary class="field-label">元の文字起こし</summary>
+      <summary class="field-label">${memo.inputMethod === 'voice' ? '元の文字起こし' : '整える前の文'}</summary>
       <div class="field-value" style="white-space:pre-wrap">${esc(memo.rawTranscript)}</div>
     </details>` : ''}
+
+    ${memo.inputMethod === 'voice' && !memo.polished ? '' : `<button class="text-btn" data-action="polish">✦ AIで文を整える</button>`}
 
     ${!memo.boxId && memo.aiStatus !== 'pending' && memo.aiStatus !== 'processing' ? `<button class="text-btn" data-action="reclassify">AIに振り分けてもらう</button>` : ''}
     <button class="text-btn danger" data-action="delete-memo">このメモを消す</button>
@@ -582,6 +585,7 @@ async function renderMemo(id) {
         toast('メモを消しました');
         return back();
       case 'deepdive': return openDeepdive(fresh);
+      case 'polish': return openPolish(fresh);
     }
   });
 
@@ -590,6 +594,51 @@ async function renderMemo(id) {
     fresh.due = e.target.value || null;
     fresh.updatedAt = Date.now();
     await put('memos', fresh);
+    rerender();
+  });
+}
+
+// キーボードのマイクで入れた文なども、あとから整えられる。整える前の文は残す
+async function openPolish(memo) {
+  if (!(await isConfigured())) return toast('先に設定でWorkerをつないでね');
+  const { sheet, close } = openSheet(`
+    <div class="sheet-title">AIで文を整える</div>
+    <div class="polish-body"><div class="loading"><span class="star-dot"></span>整えています…</div></div>`);
+  const body = sheet.querySelector('.polish-body');
+  let text;
+  try {
+    text = await polishText(memo.text);
+  } catch (e) {
+    const msg = e instanceof AiError
+      ? { quota: '今日のAI枠を使い切りました。明日もう一度試してね', unauthorized: '合言葉が違うようです', network: 'Workerにつながりませんでした' }[e.code]
+      : null;
+    body.innerHTML = `<p class="muted-text">${esc(msg || 'うまく整えられませんでした。もう一度試してね')}</p><button class="sheet-item muted" data-close>閉じる</button>`;
+    return;
+  }
+  if (text.trim() === memo.text.trim()) {
+    body.innerHTML = `<p class="muted-text">もう十分整っていました。</p><button class="sheet-item muted" data-close>閉じる</button>`;
+    return;
+  }
+  body.innerHTML = `
+    <div class="field-label">整えた文（直してから使ってもOK）</div>
+    <textarea class="memo-edit prompt-edit" id="polished">${esc(text)}</textarea>
+    <div class="row-actions">
+      <button class="pill" data-close>やめる</button>
+      <button class="pill primary" data-polish="apply">この文にする</button>
+    </div>`;
+  body.querySelector('[data-polish="apply"]').addEventListener('click', async () => {
+    const fresh = await get('memos', memo.id);
+    if (!fresh) return close();
+    if (!fresh.rawTranscript) fresh.rawTranscript = fresh.text;
+    fresh.text = body.querySelector('#polished').value.trim() || fresh.text;
+    fresh.polished = true;
+    // 描き直しの前の自動保存が、古い本文で上書きしないようにそろえておく
+    const $edit = document.getElementById('memo-edit');
+    if ($edit) $edit.value = fresh.text;
+    fresh.updatedAt = Date.now();
+    await put('memos', fresh);
+    close();
+    toast('整えました');
     rerender();
   });
 }
@@ -943,7 +992,10 @@ $form.addEventListener('submit', async (e) => {
 });
 
 setupVoice($mic, {
-  onResult: (text) => submitMemo(text, { inputMethod: 'voice', rawTranscript: text }),
+  onResult: async (text) => {
+    await submitMemo(text, { inputMethod: 'voice', rawTranscript: text });
+    if (navigator.onLine && (await isConfigured())) toast('話した内容をAIが整えています');
+  },
   onMessage: (msg) => toast(msg, 3500),
 });
 
