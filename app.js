@@ -588,6 +588,12 @@ async function renderMemo(id) {
 
     ${memo.inputMethod === 'voice' && !memo.polished ? '' : `<button class="text-btn" data-action="polish">✦ AIで文を整える</button>`}
 
+    ${memo.mergeLog?.length ? `<details class="field">
+      <summary class="field-label">あとから追記したメモ（${memo.mergeLog.length}件）</summary>
+      <ul class="merge-log">${memo.mergeLog.map((e) => `<li><span class="memo-date">${formatDate(e.added.createdAt)}${e.added.inputMethod === 'voice' ? ' · 音声' : ''}</span>${esc(clip(e.added.text, 80))}</li>`).join('')}</ul>
+      <button class="pill" data-action="undo-merge">最後の追記を取り消して、別のメモに戻す</button>
+    </details>` : ''}
+
     ${!memo.boxId && memo.aiStatus !== 'pending' && memo.aiStatus !== 'processing' ? `<button class="text-btn" data-action="reclassify">AIに振り分けてもらう</button>` : ''}
     <button class="text-btn danger" data-action="delete-memo">このメモを消す</button>
 
@@ -643,6 +649,7 @@ async function renderMemo(id) {
         return back();
       case 'deepdive': return openDeepdive(fresh);
       case 'polish': return openPolish(fresh);
+      case 'undo-merge': return undoMerge(fresh);
     }
   });
 
@@ -653,6 +660,38 @@ async function renderMemo(id) {
     await put('memos', fresh);
     rerender();
   });
+}
+
+// 自動でまとめた追記を取り消す：前のメモを追記前に戻し、追記分を別のメモとして戻す
+async function undoMerge(memo) {
+  const entry = memo.mergeLog?.[memo.mergeLog.length - 1];
+  if (!entry) return;
+  const edited = memo.updatedAt > entry.at + 1000;
+  if (!confirm(`「${clip(entry.added.text, 30)}」の追記を取り消して、別のメモに戻しますか？${edited ? '\n（追記のあとに書き直した部分も元に戻ります）' : ''}`)) return;
+  const now = Date.now();
+  await put('memos', {
+    id: newId(),
+    text: entry.added.text,
+    rawTranscript: entry.added.rawTranscript || null,
+    inputMethod: entry.added.inputMethod || 'text',
+    createdAt: entry.added.createdAt || now,
+    updatedAt: now,
+    boxId: memo.boxId,
+    labels: memo.labels,
+    due: null,
+    aiStatus: 'done',
+    polished: true,
+  });
+  memo.text = entry.prevText;
+  memo.labels = entry.prevLabels || memo.labels;
+  memo.due = entry.prevDue ?? null;
+  memo.mergeLog = memo.mergeLog.slice(0, -1);
+  memo.updatedAt = now;
+  const $edit = document.getElementById('memo-edit');
+  if ($edit) $edit.value = memo.text;
+  await put('memos', memo);
+  toast('別のメモに戻しました');
+  rerender();
 }
 
 // キーボードのマイクで入れた文なども、あとから整えられる。整える前の文は残す
@@ -1003,6 +1042,7 @@ onAiChange(() => {
   aiRenderTimer = setTimeout(() => {
     const n = takeNotice();
     if (n?.type === 'error') toast(n.message, 3500);
+    if (n?.merged?.length) toast(`前のメモ「${n.merged[0].title}」に追記しました`, 3500);
     if (currentRoute.name === 'settings') return;
     if (currentRoute.name === 'memo' && document.activeElement?.id === 'memo-edit') return;
     if (document.querySelector('.sheet-backdrop')) return;

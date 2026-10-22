@@ -1,6 +1,6 @@
 // Worker との通信と、メモの自動振り分け（仕様書5章）。
 // メモは保存済みの状態で待ち行列に入り、オンライン・設定済み・AI枠ありの時に順番に処理する。
-import { getAll, get, put, getMeta, setMeta, newId } from './db.js';
+import { getAll, get, put, del, getMeta, setMeta, newId } from './db.js';
 
 export const DEFAULT_MODEL = '@cf/openai/gpt-oss-120b';
 export const MODELS = [
@@ -130,8 +130,8 @@ export async function processQueue() {
       await put('memos', memo);
       notify();
       try {
-        await classifyMemo(memo);
-        notify({ type: 'classified', memoId: memo.id });
+        const outcome = await classifyMemo(memo);
+        notify({ type: 'classified', memoId: memo.id, merged: outcome?.merged || [] });
       } catch (e) {
         const fresh = (await get('memos', memo.id)) || memo;
         if (e.code === 'failed') {
@@ -238,7 +238,7 @@ async function classifyMemo(memo) {
     await put('memos', fresh);
     return;
   }
-  await applyResult(fresh, data.result);
+  return applyResult(fresh, data.result);
 }
 
 async function applyResult(memo, result) {
@@ -246,6 +246,8 @@ async function applyResult(memo, result) {
   const [boxes, allMemos, links, suggestions] = await Promise.all([
     getAll('boxes'), getAll('memos'), getAll('links'), getAll('suggestions'),
   ]);
+  const memoById = new Map(allMemos.map((m) => [m.id, m]));
+  const merged = [];
   const byId = new Map(boxes.map((b) => [b.id, b]));
   const norm = (s) => s.replace(/\s+/g, '').toLowerCase();
   const byName = new Map(boxes.map((b) => [norm(b.name), b]));
@@ -284,21 +286,56 @@ async function applyResult(memo, result) {
     await put('links', link);
   }
 
-  // 深掘りの結果など、箱が決まっているメモは分割しない
-  const items = memo.keepBox ? [{ ...result.items[0], text: memo.text }] : result.items;
+  // 深掘りの結果など、箱が決まっているメモは分割も合体もしない
+  const items = memo.keepBox ? [{ ...result.items[0], text: memo.text, updates: null }] : result.items;
   const splitting = items.length > 1;
+  const useAiText = splitting || (memo.inputMethod === 'voice' && !memo.polished);
+  let originalUsed = false;
 
   for (let i = 0; i < items.length; i++) {
     const item = items[i];
-    const target = i === 0 ? memo : {
+    const pieceText = useAiText ? item.text : memo.text;
+
+    // 前のメモの続き・追加・訂正なら、新しいメモを作らずに前のメモへ合わせる
+    const base = item.updates && item.updates !== memo.id ? memoById.get(item.updates) : null;
+    if (base && base.aiStatus === 'done') {
+      let mergedText = null;
+      try {
+        mergedText = (await callWorker('/merge', { base: base.text, addition: pieceText })).text;
+      } catch (e) {
+        if (e.code !== 'failed') throw e; // 枠切れ・通信エラーはあとでやり直す。AIの失敗なら普通のメモとして置く
+      }
+      if (mergedText) {
+        const latest = (await get('memos', base.id)) || base;
+        latest.mergeLog = [...(latest.mergeLog || []), {
+          at: now,
+          prevText: latest.text,
+          prevLabels: latest.labels,
+          prevDue: latest.due,
+          added: { text: pieceText, rawTranscript: memo.rawTranscript, inputMethod: memo.inputMethod, createdAt: memo.createdAt },
+        }].slice(-10);
+        latest.text = mergedText;
+        latest.labels = [...new Set([...(latest.labels || []), ...item.labels])];
+        latest.due = item.due || latest.due || null;
+        latest.updatedAt = now;
+        await put('memos', latest);
+        memoById.set(latest.id, latest);
+        merged.push({ id: latest.id, title: latest.text.split('\n')[0].slice(0, 30) });
+        const box = latest.boxId && byId.get(latest.boxId);
+        if (box) { box.updatedAt = now; await put('boxes', box); }
+        continue;
+      }
+    }
+
+    const target = !originalUsed ? memo : {
       id: newId(),
       rawTranscript: memo.rawTranscript,
       inputMethod: memo.inputMethod,
       createdAt: memo.createdAt + i, // 並び順を保つ
       splitFrom: memo.id,
     };
-    // 分割なしなら本文はそのまま（音声は整文済み）。分割した時だけAIが切り出した文を使う
-    if (splitting || (memo.inputMethod === 'voice' && !memo.polished)) target.text = item.text;
+    originalUsed = true;
+    target.text = pieceText;
     target.boxId = await resolveBox(item);
     target.labels = item.labels.length ? item.labels : ['idea'];
     target.due = item.due || null;
@@ -318,10 +355,17 @@ async function applyResult(memo, result) {
     for (const r of item.related) if (memoIds.has(r.id)) await addLink('memo-memo', target.id, r.id, r.strength);
   }
 
+  // 全部が前のメモに合わさったら、新しいメモ自体は残さない
+  if (!originalUsed) {
+    await del('memos', memo.id);
+    for (const l of links) if (l.kind === 'memo-memo' && (l.from === memo.id || l.to === memo.id)) await del('links', l.id);
+  }
+
   const m = result.merge;
   if (m && byId.has(m.a) && byId.has(m.b) && !suggestions.some((s) => pairKey(s.a, s.b) === pairKey(m.a, m.b))) {
     await put('suggestions', { id: newId(), a: m.a, b: m.b, reason: m.reason, status: 'open', createdAt: now });
   }
+  return { merged };
 }
 
 // ---------- 箱のまとめ ----------
