@@ -1,7 +1,7 @@
 import { getAll, get, put, del, getMeta, setMeta, newId, exportAll, replaceAll, DATA_STORES, clearStore } from './db.js';
 import {
   processQueue, onAiChange, takeNotice, getSettings, isConfigured, getUsage, quotaReached, nextResetTime,
-  callWorker, deepdivePrompt, polishText, pairKey, MODELS, DEFAULT_MODEL, DAILY_LIMIT, AiError,
+  callWorker, deepdivePrompt, polishText, summarizeBox, summaryKey, pairKey, MODELS, DEFAULT_MODEL, DAILY_LIMIT, AiError,
 } from './ai.js';
 import { setupVoice } from './voice.js';
 import { renderMap } from './map.js';
@@ -400,19 +400,76 @@ async function renderBox(boxId, filter) {
         ${used.map((l) => `<a class="chip label ${l} ${filter === l ? 'on' : ''}" href="#/box/${boxId}/${l}">${LABELS[l]}</a>`).join('')}
       </div>`
     : '';
-  const desc = !isInbox && box.description ? `<p class="box-desc">${esc(box.description)}</p>` : '';
+  const canSummarize = !isInbox && items.length >= 2;
+  const key = canSummarize ? summaryKey(items) : '';
+  const fresh = canSummarize && box.summary && box.summaryKey === key;
+  const summary = canSummarize
+    ? `<section class="summary-card" id="summary">
+        <div class="summary-head"><span>✦ まとめ</span>${box.summary ? `<button class="pill small" data-action="copy-summary">コピー</button>` : ''}</div>
+        <div class="summary-body" id="summary-body">${box.summary ? summaryHtml(box.summary) : `<div class="loading"><span class="star-dot"></span>まとめています…</div>`}</div>
+        ${box.summary && !fresh ? `<div class="summary-note" id="summary-note">新しいメモを反映中…</div>` : ''}
+      </section>`
+    : '';
+  const desc = !isInbox && box.description && !canSummarize ? `<p class="box-desc">${esc(box.description)}</p>` : '';
   const retry = isInbox && items.some((m) => m.aiStatus === 'failed')
     ? `<button class="text-btn" data-action="retry-failed">分類できなかったメモをAIにもう一度渡す</button>` : '';
 
   $view.innerHTML = items.length
-    ? `${desc}${chips}<ul class="cards">${shown.map(memoRowHtml).join('')}</ul>${retry}`
+    ? `${desc}${summary}${chips}<ul class="cards">${shown.map(memoRowHtml).join('')}</ul>${retry}`
     : `${desc}<div class="placeholder">この箱は空です</div>`;
+
+  $view.querySelector('[data-action="copy-summary"]')?.addEventListener('click', async () => {
+    const b = await get('boxes', boxId);
+    try {
+      await navigator.clipboard.writeText(b?.summary || '');
+      toast('まとめをコピーしました');
+    } catch {
+      toast('コピーできませんでした');
+    }
+  });
+  if (canSummarize && !fresh) refreshSummary(box, items, key);
 
   $view.querySelector('[data-action="retry-failed"]')?.addEventListener('click', async () => {
     for (const m of items.filter((x) => x.aiStatus === 'failed')) { m.aiStatus = 'pending'; m.aiTries = 0; await put('memos', m); }
     processQueue();
     rerender();
   });
+}
+
+function summaryHtml(text) {
+  return text.split('\n').map((line, i) => {
+    if (!line.trim()) return '<div class="sum-gap"></div>';
+    if (line.startsWith('・')) return `<div class="sum-item">${esc(line.slice(1))}</div>`;
+    return `<div class="${i === 0 ? 'sum-title' : 'sum-sub'}">${esc(line)}</div>`;
+  }).join('');
+}
+
+// 箱を開いた時、中身が変わっていたらまとめを作り直す（変わっていなければAI枠は使わない）
+const summarizing = new Set();
+async function refreshSummary(box, items, key) {
+  if (summarizing.has(box.id)) return;
+  const note = (msg) => {
+    const el = document.getElementById('summary-note') || document.getElementById('summary-body');
+    if (el && currentRoute.id === box.id && !box.summary) el.innerHTML = `<p class="muted-text">${esc(msg)}</p>`;
+    else if (el && currentRoute.id === box.id) el.textContent = msg;
+  };
+  if (!navigator.onLine) return note('オフラインなので、つながったらまとめます');
+  if (!(await isConfigured())) return note('設定でWorkerをつなぐと、AIがまとめを作ります');
+  if (await quotaReached()) return note('今日のAI枠を使い切ったので、明日まとめ直します');
+  summarizing.add(box.id);
+  try {
+    const summary = await summarizeBox(box, items);
+    const latest = await get('boxes', box.id);
+    if (!latest) return;
+    latest.summary = summary;
+    latest.summaryKey = key;
+    await put('boxes', latest);
+    if (currentRoute.name === 'box' && currentRoute.id === box.id && !document.querySelector('.sheet-backdrop')) rerender();
+  } catch {
+    note(box.summary ? 'まとめを更新できませんでした' : 'まとめを作れませんでした。あとでもう一度開いてね');
+  } finally {
+    summarizing.delete(box.id);
+  }
 }
 
 function memoRowHtml(m) {

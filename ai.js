@@ -324,6 +324,22 @@ async function applyResult(memo, result) {
   }
 }
 
+// ---------- 箱のまとめ ----------
+
+// 箱の中身が変わったかを見分けるための目印（メモのidと更新時刻）
+export function summaryKey(memos) {
+  return memos.map((m) => `${m.id}:${m.updatedAt}`).sort().join(',');
+}
+
+export async function summarizeBox(box, memos) {
+  const data = await callWorker('/summarize', {
+    today: localDay(),
+    box: { name: box.name, description: box.description || '' },
+    memos: [...memos].sort((a, b) => a.createdAt - b.createdAt).map((m) => ({ text: m.text, labels: m.labels, due: m.due })),
+  });
+  return data.summary;
+}
+
 // ---------- 深掘り ----------
 
 export async function deepdivePrompt(memo) {
