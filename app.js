@@ -1,7 +1,7 @@
 import { getAll, get, put, del, getMeta, setMeta, newId, exportAll, replaceAll, DATA_STORES, clearStore } from './db.js';
 import {
   processQueue, onAiChange, takeNotice, getSettings, isConfigured, getUsage, quotaReached, nextResetTime,
-  callWorker, deepdivePrompt, polishText, summarizeBox, summaryKey, pairKey, MODELS, DEFAULT_MODEL, DAILY_LIMIT, AiError,
+  callWorker, deepdivePrompt, polishText, summarizeBox, summaryKey, importPaused, pairKey, MODELS, DEFAULT_MODEL, DAILY_LIMIT, AiError,
 } from './ai.js';
 import { setupVoice } from './voice.js';
 import { renderMap } from './map.js';
@@ -283,9 +283,11 @@ async function renderHome() {
   // 未分類（AI待ち・処理中を含む）は常に一番上
   const inbox = memos.filter((m) => !m.boxId);
   if (inbox.length) {
-    const waiting = inbox.filter((m) => m.aiStatus === 'pending' || m.aiStatus === 'processing').length;
+    const importing = inbox.filter((m) => m.imported && (m.aiStatus === 'pending' || m.aiStatus === 'processing')).length;
+    const waiting = inbox.filter((m) => !m.imported && (m.aiStatus === 'pending' || m.aiStatus === 'processing')).length;
     const failed = inbox.filter((m) => m.aiStatus === 'failed').length;
     const badges = [];
+    if (importing) badges.push(`<span class="badge">取り込んだメモ ${importing}件を整理中${configured && (await importPaused()) ? '（続きは明日）' : ''}</span>`);
     if (waiting) {
       if (!configured) badges.push(`<span class="badge">AI未接続</span>`);
       else if (quota) badges.push(`<span class="badge">明日AIが整理</span>`);
@@ -295,7 +297,7 @@ async function renderHome() {
     if (failed) badges.push(`<span class="badge">分類できなかった ${failed}件</span>`);
     cards.push(cardHtml({
       href: `#/box/${INBOX}`,
-      name: waiting && configured && !quota && navigator.onLine && waiting === inbox.length ? '処理中…' : '未分類',
+      name: waiting && configured && !quota && navigator.onLine && waiting + importing === inbox.length && !importing ? '処理中…' : '未分類',
       count: inbox.length,
       latest: firstLine(inbox[0].text),
       meta: badges.join(''),
@@ -896,6 +898,14 @@ async function renderSettings() {
     </section>
 
     <section class="panel">
+      <h2>ほかのメモを取り込む</h2>
+      <p class="muted-text">Appleのメモから書き出したファイル（apple-notes.json）を選ぶと、まとめて取り込みます。AIが毎日少しずつ箱に整理します（新しく書いたメモが先）。</p>
+      <div class="row-actions">
+        <label class="pill">ファイルを選ぶ<input type="file" id="s-notes" accept="application/json,.json" hidden></label>
+      </div>
+    </section>
+
+    <section class="panel">
       <h2>全データ削除</h2>
       <p class="muted-text">メモ・箱・つながり・修正履歴をすべて消します。接続の設定は残ります。</p>
       <button class="text-btn danger" data-action="wipe" style="margin-top:8px">全データを削除</button>
@@ -965,6 +975,20 @@ async function renderSettings() {
     }
   });
 
+  document.getElementById('s-notes').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    let data;
+    try {
+      data = JSON.parse(await file.text());
+    } catch {
+      return toast('ファイルを読めませんでした');
+    }
+    if (data.app !== 'yozora-import' || !Array.isArray(data.notes)) return toast('取り込み用のファイルではないようです');
+    openImportSheet(data.notes.filter((n) => typeof n.text === 'string' && n.text.trim()));
+  });
+
   document.getElementById('s-import').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     e.target.value = '';
@@ -980,6 +1004,57 @@ async function renderSettings() {
     await replaceAll(data);
     if (data.settings?.workerUrl && !(await getMeta('workerUrl', ''))) await setMeta('workerUrl', data.settings.workerUrl);
     toast('復元しました');
+    go('#/');
+  });
+}
+
+// ---------- 取り込み ----------
+
+// フォルダごとに取り込むかを選べる（AIに送りたくないフォルダは外せる）
+async function openImportSheet(notes) {
+  const folders = [...new Set(notes.map((n) => n.folder || 'その他'))];
+  const count = (f) => notes.filter((n) => (n.folder || 'その他') === f).length;
+  const { sheet, close } = openSheet(`
+    <div class="sheet-title">取り込むフォルダを選んでね（${notes.length}件）</div>
+    <p class="muted-text">チェックしたフォルダのメモは、箱に整理するためにAI（Cloudflare）に送られます。</p>
+    <div class="sheet-list">
+      ${folders.map((f, i) => `<label class="check-row"><input type="checkbox" data-folder="${i}" checked><span>${esc(f)}</span><span class="card-count">${count(f)}</span></label>`).join('')}
+    </div>
+    <div class="row-actions">
+      <button class="pill" data-close>やめる</button>
+      <button class="pill primary" data-act="import">取り込む</button>
+    </div>`);
+  sheet.querySelector('[data-act="import"]').addEventListener('click', async () => {
+    const chosen = new Set([...sheet.querySelectorAll('[data-folder]')].filter((c) => c.checked).map((c) => folders[+c.dataset.folder]));
+    const picked = notes.filter((n) => chosen.has(n.folder || 'その他'));
+    if (!picked.length) return toast('フォルダを選んでね');
+    // 同じファイルを2回取り込んでも重複しないように
+    const existing = new Set((await getAll('memos')).map((m) => m.importKey).filter(Boolean));
+    let added = 0;
+    for (const n of picked) {
+      const key = `apple-notes:${n.createdAt}:${n.text.slice(0, 40)}`;
+      if (existing.has(key)) continue;
+      const created = Number(n.createdAt) || Date.now();
+      await put('memos', {
+        id: newId(),
+        text: n.text.trim(),
+        rawTranscript: null,
+        inputMethod: 'text',
+        createdAt: created,
+        updatedAt: Number(n.updatedAt) || created,
+        boxId: null,
+        labels: [],
+        due: null,
+        aiStatus: 'pending',
+        imported: true,
+        importKey: key,
+        sourceFolder: n.folder || null,
+      });
+      added++;
+    }
+    close();
+    toast(added ? `${added}件取り込みました。AIが少しずつ整理します` : 'もう取り込み済みでした', 3500);
+    processQueue();
     go('#/');
   });
 }

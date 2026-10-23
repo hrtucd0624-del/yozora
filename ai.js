@@ -10,6 +10,7 @@ export const MODELS = [
 ];
 export const DAILY_LIMIT = 10000;
 const SAFE_LIMIT = 9400; // 上限の少し手前で翌日に回す
+const IMPORT_LIMIT = 7000; // 取り込んだ昔のメモはここまで。残りは毎日の新しいメモのためにとっておく
 const MAX_TRIES = 3;
 
 export class AiError extends Error {
@@ -55,6 +56,10 @@ async function addUsage(neurons, exhausted = false) {
   u.neurons = Math.round((u.neurons + (neurons || 0)) * 10) / 10;
   if (exhausted) u.exhausted = true;
   await setMeta('usage', u);
+}
+
+export async function importPaused() {
+  return (await getUsage()).neurons >= IMPORT_LIMIT;
 }
 
 export async function quotaReached() {
@@ -121,11 +126,13 @@ export async function processQueue() {
   running = true;
   try {
     for (;;) {
+      // 新しく書いたメモを先に。取り込んだ昔のメモはそのあと、1日の枠を使いすぎない範囲で
       const waiting = (await getAll('memos'))
         .filter((m) => m.aiStatus === 'pending' || m.aiStatus === 'processing')
-        .sort((a, b) => a.createdAt - b.createdAt);
+        .sort((a, b) => (a.imported ? 1 : 0) - (b.imported ? 1 : 0) || a.createdAt - b.createdAt);
       if (!waiting.length) break;
       const memo = waiting[0];
+      if (memo.imported && (await getUsage()).neurons >= IMPORT_LIMIT) break;
       memo.aiStatus = 'processing';
       await put('memos', memo);
       notify();
@@ -227,7 +234,8 @@ async function classifyMemo(memo) {
   const data = await callWorker('/classify', {
     today: localDay(),
     // 整文済みの音声メモは、振り分けで本文を書き換えないよう text として渡す
-    memo: { text: memo.text, inputMethod: memo.inputMethod === 'voice' && !memo.polished ? 'voice' : 'text' },
+    memo: { text: memo.text, inputMethod: memo.inputMethod === 'voice' && !memo.polished ? 'voice' : 'text', sourceFolder: memo.sourceFolder },
+    noSplit: Boolean(memo.imported), // 取り込んだメモは長いことがあるので、分けずにそのまま箱へ
     ...ctx,
   });
   const fresh = await get('memos', memo.id);
@@ -286,8 +294,8 @@ async function applyResult(memo, result) {
     await put('links', link);
   }
 
-  // 深掘りの結果など、箱が決まっているメモは分割も合体もしない
-  const items = memo.keepBox ? [{ ...result.items[0], text: memo.text, updates: null }] : result.items;
+  // 深掘りの結果や取り込んだメモは、分割も合体もしない（本文はそのまま）
+  const items = memo.keepBox || memo.imported ? [{ ...result.items[0], text: memo.text, updates: null }] : result.items;
   const splitting = items.length > 1;
   const useAiText = splitting || (memo.inputMethod === 'voice' && !memo.polished);
   let originalUsed = false;
