@@ -1,6 +1,6 @@
 // Worker との通信と、メモの自動振り分け（仕様書5章）。
 // メモは保存済みの状態で待ち行列に入り、オンライン・設定済み・AI枠ありの時に順番に処理する。
-import { getAll, get, put, del, getMeta, setMeta, newId } from './db.js';
+import { getAll, get, put, del, getMeta, setMeta, newId, getDeviceId } from './db.js';
 
 export const DEFAULT_MODEL = '@cf/openai/gpt-oss-120b';
 export const MODELS = [
@@ -72,7 +72,7 @@ export async function quotaReached() {
 export async function callWorker(path, body = {}) {
   const s = await getSettings();
   if (!s.workerUrl || !s.passphrase) throw new AiError('not_configured');
-  if (path !== '/ping' && (await quotaReached())) throw new AiError('quota');
+  if (path !== '/ping' && path !== '/sync' && (await quotaReached())) throw new AiError('quota');
   let res;
   try {
     res = await fetch(s.workerUrl.replace(/\/+$/, '') + path, {
@@ -86,6 +86,7 @@ export async function callWorker(path, body = {}) {
   let data = null;
   try { data = await res.json(); } catch { /* 空 */ }
   if (res.status === 401) throw new AiError('unauthorized');
+  if (data?.error === 'locked') throw new AiError('locked'); // 合言葉の間違いが多すぎて一時的に止められている
   if (res.status === 429 || data?.error === 'quota') {
     await addUsage(0, true);
     throw new AiError('quota');
@@ -127,8 +128,10 @@ export async function processQueue() {
   try {
     for (;;) {
       // 新しく書いたメモを先に。取り込んだ昔のメモはそのあと、1日の枠を使いすぎない範囲で
+      // 同期している時、AIの振り分けはそのメモを書いた端末だけが行う（二重に処理しないため）
+      const me = await getDeviceId();
       const waiting = (await getAll('memos'))
-        .filter((m) => m.aiStatus === 'pending' || m.aiStatus === 'processing')
+        .filter((m) => (m.aiStatus === 'pending' || m.aiStatus === 'processing') && (!m.origin || m.origin === me))
         .sort((a, b) => (a.imported ? 1 : 0) - (b.imported ? 1 : 0) || a.createdAt - b.createdAt);
       if (!waiting.length) break;
       const memo = waiting[0];
@@ -150,6 +153,7 @@ export async function processQueue() {
         await put('memos', fresh);
         if (e.code === 'quota') notify({ type: 'quota' });
         else if (e.code === 'unauthorized') notify({ type: 'error', message: '合言葉が違うようです。設定を確認してね' });
+        else if (e.code === 'locked') notify({ type: 'error', message: '合言葉の間違いが続いたので、1時間ほどAIが止まっています' });
         else if (e.code === 'network') notify({ type: 'error', message: 'Workerにつながりませんでした。あとで自動で再開します' });
         else notify({ type: 'error', message: 'AI処理に失敗しました。あとでもう一度試します' });
         break;

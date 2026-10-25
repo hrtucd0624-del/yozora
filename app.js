@@ -1,4 +1,5 @@
-import { getAll, get, put, del, getMeta, setMeta, newId, exportAll, replaceAll, DATA_STORES, clearStore } from './db.js';
+import { getAll, get, put, del, getMeta, setMeta, newId, exportAll, replaceAll, DATA_STORES, clearStore, getDeviceId } from './db.js';
+import { startSync, syncNow, syncStatus, onSyncChange, resetSync } from './sync.js';
 import {
   processQueue, onAiChange, takeNotice, getSettings, isConfigured, getUsage, quotaReached, nextResetTime,
   callWorker, deepdivePrompt, polishText, summarizeBox, summaryKey, importPaused, pairKey, MODELS, DEFAULT_MODEL, DAILY_LIMIT, AiError,
@@ -146,6 +147,7 @@ async function addMemo(text, { inputMethod = 'text', rawTranscript = null, boxId
     labels: [],
     due: null,
     aiStatus: 'pending', // pending → processing → done / failed
+    origin: await getDeviceId(), // AIの振り分けはこの端末が担当
   };
   if (boxId) memo.keepBox = true;
   await put('memos', memo);
@@ -856,6 +858,7 @@ async function renderSettings() {
   $topbar.innerHTML = `${backBtn}<span class="title">設定</span>`;
   const s = await getSettings();
   const usage = await getUsage();
+  const sync = await syncStatus();
   const known = MODELS.some(([id]) => id === s.model);
   const reset = nextResetTime();
 
@@ -880,6 +883,14 @@ async function renderSettings() {
         <button class="pill primary" data-action="save">保存</button>
       </div>
       <p class="muted-text" id="s-status"></p>
+    </section>
+
+    <section class="panel">
+      <h2>iPhoneとMacの同期</h2>
+      <p class="muted-text">同じWorker URLと合言葉を入れた端末どうしで、メモ・箱・つながりが自動で同期されます（データはあなたのCloudflareにも保存されます）。</p>
+      <label class="check-row"><input type="checkbox" id="s-sync" ${sync.enabled ? 'checked' : ''}><span>同期する</span></label>
+      <p class="muted-text" id="s-sync-status">${esc(syncLine(sync))}</p>
+      <div class="row-actions"><button class="pill" data-action="sync-now">今すぐ同期</button></div>
     </section>
 
     <section class="panel">
@@ -936,6 +947,15 @@ async function renderSettings() {
       await saveSettings();
       $status.textContent = '保存しました';
       processQueue();
+      syncNow().then(async () => {
+        const el = document.getElementById('s-sync-status');
+        if (el) el.textContent = syncLine(await syncStatus());
+      });
+    }
+    if (act === 'sync-now') {
+      document.getElementById('s-sync-status').textContent = '同期中…';
+      await syncNow();
+      document.getElementById('s-sync-status').textContent = syncLine(await syncStatus());
     }
     if (act === 'test') {
       await saveSettings();
@@ -944,10 +964,12 @@ async function renderSettings() {
         const r = await callWorker('/ping');
         $status.textContent = `つながりました（${r.model}）`;
         processQueue();
+        syncNow();
       } catch (err) {
         $status.textContent = {
           not_configured: 'URLと合言葉を入れてね',
           unauthorized: '合言葉が違います',
+          locked: '合言葉の間違いが続いたので、1時間ほど待ってからもう一度試してね',
           network: 'Workerにつながりません。URLを確認してね',
         }[err.code] || 'うまくいきませんでした';
       }
@@ -966,13 +988,19 @@ async function renderSettings() {
       setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     }
     if (act === 'wipe') {
-      if (!confirm('すべてのメモと箱を消します。元に戻せません。よろしいですか？')) return;
+      if (!confirm('すべてのメモと箱を消します。同期しているほかの端末からも消えます。元に戻せません。よろしいですか？')) return;
       if (!confirm('本当に消しますか？（バックアップは取りましたか？）')) return;
       for (const name of DATA_STORES) await clearStore(name);
       try { localStorage.removeItem('yozora.mapPos'); } catch { /* 無視 */ }
       toast('全データを削除しました');
       go('#/');
     }
+  });
+
+  document.getElementById('s-sync').addEventListener('change', async (e) => {
+    await setMeta('syncEnabled', e.target.checked);
+    if (e.target.checked) await resetSync();
+    document.getElementById('s-sync-status').textContent = syncLine(await syncStatus());
   });
 
   document.getElementById('s-notes').addEventListener('change', async (e) => {
@@ -1000,12 +1028,19 @@ async function renderSettings() {
       return toast('JSONとして読めませんでした');
     }
     if (data.app !== 'yozora' || !Array.isArray(data.memos)) return toast('Yozoraのバックアップではないようです');
-    if (!confirm(`${new Date(data.exportedAt).toLocaleString()} のバックアップ（メモ${data.memos.length}件）で、今のデータを置き換えますか？`)) return;
+    if (!confirm(`${new Date(data.exportedAt).toLocaleString()} のバックアップ（メモ${data.memos.length}件）で、今のデータを置き換えますか？\n同期しているほかの端末のデータも置き換わります。`)) return;
     await replaceAll(data);
     if (data.settings?.workerUrl && !(await getMeta('workerUrl', ''))) await setMeta('workerUrl', data.settings.workerUrl);
     toast('復元しました');
     go('#/');
   });
+}
+
+function syncLine(st) {
+  if (!st.enabled) return '同期はオフです';
+  if (st.error) return `前回：${st.error}`;
+  const when = st.lastSync ? `最後に同期：${formatDate(st.lastSync)}` : 'まだ同期していません';
+  return st.pending ? `${when}（未送信 ${st.pending}件）` : when;
 }
 
 // ---------- 取り込み ----------
@@ -1048,6 +1083,7 @@ async function openImportSheet(notes) {
         aiStatus: 'pending',
         imported: true,
         importKey: key,
+        origin: await getDeviceId(),
         sourceFolder: n.folder || null,
       });
       added++;
@@ -1188,3 +1224,13 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
 }
 route();
 processQueue();
+startSync();
+
+// ほかの端末から変更が届いたら描き直す（編集中・シートを開いている時は邪魔しない）
+onSyncChange(({ pulled }) => {
+  if (!pulled) return;
+  if (currentRoute.name === 'settings') return;
+  if (currentRoute.name === 'memo' && document.activeElement?.id === 'memo-edit') return;
+  if (document.querySelector('.sheet-backdrop')) return;
+  rerender();
+});

@@ -1,9 +1,9 @@
 // オフラインでも開けるようにするサービスワーカー。
 // アプリのファイルは「ネット優先・だめならキャッシュ」なので、更新はすぐ反映される。
-const CACHE = 'yozora-v6';
+const CACHE = 'yozora-v7';
 const SHELL = [
   './', 'index.html', 'style.css', 'manifest.webmanifest',
-  'app.js', 'db.js', 'ai.js', 'voice.js', 'map.js',
+  'app.js', 'db.js', 'ai.js', 'voice.js', 'map.js', 'sync.js',
   'icon-180.png', 'icon-192.png', 'icon-512.png',
 ];
 
